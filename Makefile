@@ -1,17 +1,18 @@
 # Makefile for snifer
 #
 # Platforms:
-#   Linux, macOS (POSIX) with libpcap and ncurses installed.
+#   Linux, macOS (POSIX) with libpcap and ncurses installed.  Windows via
+#   WSL, Cygwin, or MSYS2 (MinGW) with the same dependencies.
 #
 # Build:
-#   make              Build the snifer binary
-#   make menuconfig   Launch the interactive capture setup
-#   make clean        Remove built objects and binary
+#   make              Build the snifer binary (into build/)
+#   make menuconfig   Launch the interactive TUI capture setup
+#   make clean        Remove the entire build/ directory
 #
 # Run:
-#   ./snifer          Interactive mode
-#   ./snifer --menuconfig  TUI setup mode
-#   ./snifer --help   CLI flags
+#   ./build/snifer                 Interactive mode
+#   ./build/snifer --menuconfig    TUI setup mode
+#   ./build/snifer --help          CLI flags
 
 CC ?= cc
 CFLAGS ?= -Wall -Wextra -O2 -std=c11
@@ -31,23 +32,32 @@ endif
 
 LDFLAGS ?= -lpcap $(NCURSES_LIBS)
 
+BUILD_DIR = build
+OBJ_DIR   = $(BUILD_DIR)/obj_file
+TARGET    = $(BUILD_DIR)/snifer
+
 SRCS = src/main.c src/snifer.c src/menu.c
 HDRS = include/snifer.h include/tui_menu.h
-OBJS = $(SRCS:.c=.o)
-TARGET = snifer
+OBJS = $(SRCS:src/%.c=$(OBJ_DIR)/%.o)
 
 .PHONY: all clean menuconfig
 
 all: $(TARGET)
 
 menuconfig: $(TARGET)
-	@./$(TARGET) --menuconfig
+	@$(TARGET) --menuconfig
+
+$(OBJ_DIR):
+	mkdir -p $(OBJ_DIR)
+
+$(OBJ_DIR)/%.o: src/%.c $(HDRS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) $(NCURSES_CFLAGS) -I include -c -o $@ $<
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LDFLAGS)
 
 src/%.o: src/%.c $(HDRS)
 	$(CC) $(CFLAGS) $(NCURSES_CFLAGS) -I include -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -rf $(BUILD_DIR)
