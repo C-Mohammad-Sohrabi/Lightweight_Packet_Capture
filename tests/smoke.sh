@@ -1,6 +1,6 @@
 #!/bin/sh
 # Smoke tests for snifer
-# These tests script the interactive prompts enough to reach a clean exit.
+# These tests verify basic CLI functionality.
 
 set -eu
 
@@ -40,11 +40,8 @@ else
     fail "--help output missing expected banner"
 fi
 
-# 2) --list should print interface info and exit successfully when scripted.
-#    On a machine with multiple interfaces, the interactive prompt would
-#    normally ask for a choice; here we provide one so the runner can exit.
-printf "%s\n" "1" "" "" "" |
-    "$SNIFER" --list >"$TMPFILE" 2>&1
+# 2) --list should print interface info and exit successfully
+"$SNIFER" --list >"$TMPFILE" 2>&1
 
 if grep -q "Available" "$TMPFILE"; then
     printf "ok: --list enumerates interfaces\n\n"

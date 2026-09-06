@@ -18,6 +18,8 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <stdarg.h>
+#include <stdint.h>
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -46,51 +48,258 @@ static void snifer_signal_handler(int signo)
  * Tiny helpers
  * --------------------------------------------------------------------------- */
 
-/* Quiet stdout/stderr buffering so the menu and capture output don't get
- * interleaved in odd ways. */
-
-
-static int snifer_strtolower(char *dst, const char *src, size_t n)
+static void snifer_set_error(char *errbuf, size_t errbuf_size,
+                             const char *fmt, ...)
 {
-    size_t i;
-    for (i = 0; i < n && src[i] != '\0'; ++i) {
-        dst[i] = (char)tolower((unsigned char)src[i]);
+    va_list ap;
+
+    if (errbuf == NULL || errbuf_size == 0) {
+        return;
     }
-    dst[i] = '\0';
-    return (int)i;
+    va_start(ap, fmt);
+    (void)vsnprintf(errbuf, errbuf_size, fmt, ap);
+    va_end(ap);
 }
 
-/* Normalize a type string for comparison: "tcp" -> "tcp", "TCP" -> "tcp",
- * whitespace trimmed, no prefix/suffix surprises. */
-static int snifer_parse_packet_type(const char *input, char *out, size_t out_size)
+static void snifer_copy_error(char *dst, size_t dst_size, const char *src)
 {
-    char tmp[64];
-    if (input == NULL) {
-        out[0] = '\0';
+    if (dst == NULL || dst_size == 0) {
+        return;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+    (void)snprintf(dst, dst_size, "%s", src);
+}
+
+static int snifer_token_equals(const char *token, size_t token_len,
+                               const char *literal)
+{
+    size_t literal_len = strlen(literal);
+    size_t i;
+
+    if (token_len != literal_len) {
         return 0;
     }
-    size_t len = strnlen(input, sizeof(tmp) - 1);
-    if (len == 0 || len >= sizeof(tmp)) {
+    for (i = 0; i < token_len; ++i) {
+        if (tolower((unsigned char)token[i]) !=
+            tolower((unsigned char)literal[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+enum snifer_type_bit {
+    SNIFER_TYPE_TCP = 1 << 0,
+    SNIFER_TYPE_UDP = 1 << 1,
+    SNIFER_TYPE_ICMP = 1 << 2,
+    SNIFER_TYPE_ARP = 1 << 3,
+    SNIFER_TYPE_IPV4 = 1 << 4,
+    SNIFER_TYPE_IPV6 = 1 << 5
+};
+
+static int snifer_type_bit_for_token(const char *token, size_t token_len)
+{
+    if (snifer_token_equals(token, token_len, "tcp")) {
+        return SNIFER_TYPE_TCP;
+    }
+    if (snifer_token_equals(token, token_len, "udp")) {
+        return SNIFER_TYPE_UDP;
+    }
+    if (snifer_token_equals(token, token_len, "icmp") ||
+        snifer_token_equals(token, token_len, "icmp6") ||
+        snifer_token_equals(token, token_len, "icmpv6")) {
+        return SNIFER_TYPE_ICMP;
+    }
+    if (snifer_token_equals(token, token_len, "arp")) {
+        return SNIFER_TYPE_ARP;
+    }
+    if (snifer_token_equals(token, token_len, "ipv4") ||
+        snifer_token_equals(token, token_len, "ip")) {
+        return SNIFER_TYPE_IPV4;
+    }
+    if (snifer_token_equals(token, token_len, "ipv6") ||
+        snifer_token_equals(token, token_len, "ip6")) {
+        return SNIFER_TYPE_IPV6;
+    }
+    return 0;
+}
+
+/* Parse the small packet-type language used by the menu and CLI. The parser
+ * deliberately accepts only protocol names joined by OR; accepting arbitrary
+ * BPF text here made malformed menu combinations easy to generate. */
+static int snifer_parse_type_bits(const char *input, int *bits_out,
+                                  size_t bits_cap, size_t *count_out,
+                                  int *all_out)
+{
+    const char *p = input;
+    size_t count = 0;
+    int all = 0;
+    int need_term = 1;
+    int saw_term = 0;
+    unsigned int depth = 0;
+
+    if (bits_out == NULL || count_out == NULL || all_out == NULL ||
+        bits_cap == 0) {
         return -1;
     }
-    memcpy(tmp, input, len);
-    tmp[len] = '\0';
 
-    /* trim leading whitespace */
-    char *p = tmp;
-    while (*p && isspace((unsigned char)*p)) ++p;
-
-    /* trim trailing whitespace */
-    char *end = p + strnlen(p, sizeof(tmp));
-    while (end > p && isspace((unsigned char)*(end - 1))) --end;
-    *end = '\0';
-
-    if (*p == '\0') {
-        out[0] = '\0';
+    if (p == NULL) {
+        *count_out = 0;
+        *all_out = 1;
         return 0;
     }
 
-    snifer_strtolower(out, p, out_size);
+    while (*p != '\0') {
+        while (*p != '\0' && isspace((unsigned char)*p)) {
+            ++p;
+        }
+        if (*p == '(') {
+            ++depth;
+            ++p;
+            continue;
+        }
+        if (*p == ')') {
+            if (depth == 0) {
+                return -1;
+            }
+            --depth;
+            ++p;
+            continue;
+        }
+        if (*p == '|') {
+            if (need_term) {
+                return -1;
+            }
+            need_term = 1;
+            ++p;
+            if (*p == '|') {
+                ++p;
+            }
+            continue;
+        }
+        if (*p == '\0') {
+            break;
+        }
+
+        const char *start = p;
+        while (*p != '\0' && !isspace((unsigned char)*p) &&
+               *p != '(' && *p != ')' && *p != '|') {
+            ++p;
+        }
+        size_t token_len = (size_t)(p - start);
+        if (token_len == 0) {
+            continue;
+        }
+
+        if (snifer_token_equals(start, token_len, "or")) {
+            if (need_term || !saw_term) {
+                return -1;
+            }
+            need_term = 1;
+            continue;
+        }
+
+        if (!need_term) {
+            return -1;
+        }
+        if (snifer_token_equals(start, token_len, "all")) {
+            all = 1;
+            saw_term = 1;
+            need_term = 0;
+            continue;
+        }
+
+        int bit = snifer_type_bit_for_token(start, token_len);
+        if (bit == 0) {
+            return -1;
+        }
+        int duplicate = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (bits_out[i] == bit) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (!duplicate) {
+            if (count >= bits_cap) {
+                return -1;
+            }
+            bits_out[count++] = bit;
+        }
+        saw_term = 1;
+        need_term = 0;
+    }
+
+    if (depth != 0 || (saw_term && need_term)) {
+        return -1;
+    }
+    if (!saw_term) {
+        all = 1;
+    }
+    *count_out = count;
+    *all_out = all;
+    return 0;
+}
+
+static const char *snifer_type_expression(int bit)
+{
+    switch (bit) {
+    case SNIFER_TYPE_TCP:
+        return "tcp";
+    case SNIFER_TYPE_UDP:
+        return "udp";
+    case SNIFER_TYPE_ICMP:
+        return "(icmp or icmp6)";
+    case SNIFER_TYPE_ARP:
+        return "arp";
+    case SNIFER_TYPE_IPV4:
+        return "ip";
+    case SNIFER_TYPE_IPV6:
+        return "ip6";
+    default:
+        return NULL;
+    }
+}
+
+static int snifer_append_text(char *buf, size_t buf_size, size_t *pos,
+                              const char *text)
+{
+    size_t len;
+
+    if (buf == NULL || pos == NULL || text == NULL || buf_size == 0 ||
+        *pos >= buf_size) {
+        return -1;
+    }
+    len = strlen(text);
+    if (len > buf_size - 1 - *pos) {
+        return -1;
+    }
+    memcpy(buf + *pos, text, len);
+    *pos += len;
+    buf[*pos] = '\0';
+    return 0;
+}
+
+static int snifer_append_format(char *buf, size_t buf_size, size_t *pos,
+                                const char *fmt, ...)
+{
+    va_list ap;
+    int needed;
+
+    if (buf == NULL || pos == NULL || fmt == NULL || buf_size == 0 ||
+        *pos >= buf_size) {
+        return -1;
+    }
+    va_start(ap, fmt);
+    needed = vsnprintf(buf + *pos, buf_size - *pos, fmt, ap);
+    va_end(ap);
+    if (needed < 0 || (size_t)needed > buf_size - 1 - *pos) {
+        return -1;
+    }
+    *pos += (size_t)needed;
     return 0;
 }
 
@@ -100,23 +309,25 @@ static int snifer_parse_packet_type(const char *input, char *out, size_t out_siz
 
 int sniffer_list_devices(char *errbuf, size_t errbuf_size)
 {
-    (void)errbuf_size;
     pcap_if_t *alldevs = NULL;
     pcap_if_t *d = NULL;
     int count = 0;
+    char pcap_errbuf[PCAP_ERRBUF_SIZE] = {0};
 
-    if (pcap_findalldevs(&alldevs, errbuf) == -1) {
+    if (pcap_findalldevs(&alldevs, pcap_errbuf) == -1) {
+        snifer_copy_error(errbuf, errbuf_size, pcap_errbuf);
         fprintf(stderr, "snifer: failed to enumerate interfaces: %s\n",
-                errbuf);
+                pcap_errbuf);
         return -1;
     }
 
     if (alldevs == NULL) {
+        snifer_set_error(errbuf, errbuf_size,
+                         "no capture interfaces found");
         fprintf(stderr,
                 "snifer: no capture interfaces found. Do you have permissions\n"
                 "        to capture packets (e.g. run with elevated privileges\n"
                 "        or add your user to the packet capture group)?\n");
-        pcap_freealldevs(alldevs);
         return -1;
     }
 
@@ -156,6 +367,10 @@ int sniffer_list_devices(char *errbuf, size_t errbuf_size)
     }
     pcap_freealldevs(alldevs);
 
+    if (errbuf != NULL && errbuf_size > 0) {
+        errbuf[0] = '\0';
+    }
+
     if (count == 0) {
         fprintf(stderr,
                 "snifer: no usable interfaces found. On Linux you may need\n"
@@ -176,9 +391,10 @@ pcap_t *sniffer_open_interface(const char *device_name,
                                char *errbuf,
                                size_t errbuf_size)
 {
+    char pcap_errbuf[PCAP_ERRBUF_SIZE] = {0};
+
     if (device_name == NULL || device_name[0] == '\0') {
-        snprintf(errbuf, errbuf_size,
-                 "no interface specified");
+        snifer_set_error(errbuf, errbuf_size, "no interface specified");
         return NULL;
     }
 
@@ -196,9 +412,14 @@ pcap_t *sniffer_open_interface(const char *device_name,
     int timeout = 50;    /* milliseconds; affects pcap_next_ex readiness */
 
     pcap_t *handle = pcap_open_live(device_name, snaplen, promisc,
-                                    timeout, errbuf);
+                                    timeout, pcap_errbuf);
     if (handle == NULL) {
+        snifer_copy_error(errbuf, errbuf_size, pcap_errbuf);
         return NULL;
+    }
+
+    if (errbuf != NULL && errbuf_size > 0) {
+        errbuf[0] = '\0';
     }
 
     /* Verify link-layer type is usable before proceeding. */
@@ -215,113 +436,168 @@ pcap_t *sniffer_open_interface(const char *device_name,
 static int snifer_build_filter(const struct sniffer_options *opts,
                               char *buf, size_t bufsz)
 {
-    char type[64] = {0};
-    if (snifer_parse_packet_type(opts->packet_type, type, sizeof(type)) !=
-        0) {
+    enum { MAX_TYPE_TERMS = 8 };
+    int type_bits[MAX_TYPE_TERMS];
+    size_t type_count = 0;
+    int all_types = 1;
+    int tcp_selected = 0;
+    int udp_selected = 0;
+    char clauses[3][256];
+    size_t clause_count = 0;
+    size_t pos = 0;
+
+    if (buf == NULL || bufsz == 0) {
+        return -1;
+    }
+    buf[0] = '\0';
+
+    if (snifer_parse_type_bits(opts != NULL ? opts->packet_type : NULL,
+                               type_bits, MAX_TYPE_TERMS, &type_count,
+                               &all_types) != 0) {
         return -1;
     }
 
-    /*
-     * We build a single pcap filter expression where practical.
-     *
-     * pcap filter syntax is documented at:
-     *   https://www.tcpdump.org/manpages/pcap-filter.7.html
-     *
-     * Notes on portability:
-     *   - "ether proto", "ip", "tcp", "udp", "icmp" are widely supported.
-     *   - IPv6 filters ("ip6") are supported on modern libpcap/Npcap.
-     *   - ARP is common but syntax can vary slightly between platforms.
-     *     We handle ARP via a separate code path when needed.
-     */
-    enum { MAX_FILTER = 1024 };
-    char parts[8][MAX_FILTER];
-    int nparts = 0;
+    for (size_t i = 0; i < type_count; ++i) {
+        if (type_bits[i] == SNIFER_TYPE_TCP) {
+            tcp_selected = 1;
+        } else if (type_bits[i] == SNIFER_TYPE_UDP) {
+            udp_selected = 1;
+        }
+    }
 
-    if (opts->packet_type != NULL && type[0] != '\0') {
-        if (strcmp(type, "all") == 0) {
-            /* nothing to add */
-        } else if (strcmp(type, "tcp") == 0) {
-            snprintf(parts[nparts], MAX_FILTER, "tcp");
-            nparts++;
-        } else if (strcmp(type, "udp") == 0) {
-            snprintf(parts[nparts], MAX_FILTER, "udp");
-            nparts++;
-        } else if (strcmp(type, "icmp") == 0) {
-            snprintf(parts[nparts], MAX_FILTER, "icmp or icmp6");
-            nparts++;
-        } else if (strcmp(type, "arp") == 0) {
-            /* ARP is not IP-based; keep separate */
-            snprintf(parts[nparts], MAX_FILTER, "arp");
-            nparts++;
-        } else if (strcmp(type, "ipv4") == 0) {
-            snprintf(parts[nparts], MAX_FILTER, "ip");
-            nparts++;
-        } else if (strcmp(type, "ipv6") == 0) {
-            snprintf(parts[nparts], MAX_FILTER, "ip6");
-            nparts++;
-        } else {
-            /* Unknown literal: treat as a raw pcap expression if it
-             * contains operator characters; otherwise reject. */
-            if (strpbrk(type, "&=|~()!")) {
-                snprintf(parts[nparts], MAX_FILTER, "%s", type);
-                nparts++;
-            } else {
+    if (!all_types && type_count > 0) {
+        size_t type_pos = 0;
+        clauses[clause_count][0] = '\0';
+        if (type_count > 1 &&
+            snifer_append_text(clauses[clause_count],
+                               sizeof(clauses[clause_count]), &type_pos,
+                               "(") != 0) {
+            return -1;
+        }
+        for (size_t i = 0; i < type_count; ++i) {
+            const char *expr = snifer_type_expression(type_bits[i]);
+            if (expr == NULL) {
+                return -1;
+            }
+            if (i > 0 &&
+                snifer_append_text(clauses[clause_count],
+                                   sizeof(clauses[clause_count]), &type_pos,
+                                   " or ") != 0) {
+                return -1;
+            }
+            if (snifer_append_text(clauses[clause_count],
+                                   sizeof(clauses[clause_count]), &type_pos,
+                                   expr) != 0) {
                 return -1;
             }
         }
-    }
-
-    if (opts->ip_addr != NULL && opts->ip_addr[0] != '\0') {
-        /* Use inet_pton to validate and build the filter. We only support
-         * IPv4 here for simplicity. */
-        struct in_addr addr;
-        if (inet_pton(AF_INET, opts->ip_addr, &addr) != 1) {
+        if (type_count > 1 &&
+            snifer_append_text(clauses[clause_count],
+                               sizeof(clauses[clause_count]), &type_pos,
+                               ")") != 0) {
             return -1;
         }
+        ++clause_count;
+    }
+
+    if (opts != NULL && opts->ip_addr != NULL && opts->ip_addr[0] != '\0') {
+        struct in_addr addr;
         char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &addr, ip, sizeof(ip));
-        snprintf(parts[nparts], MAX_FILTER, "(host %s)", ip);
-        nparts++;
+
+        if (inet_pton(AF_INET, opts->ip_addr, &addr) != 1 ||
+            inet_ntop(AF_INET, &addr, ip, sizeof(ip)) == NULL) {
+            return -1;
+        }
+        size_t ip_pos = 0;
+        clauses[clause_count][0] = '\0';
+        if (snifer_append_format(clauses[clause_count],
+                                 sizeof(clauses[clause_count]), &ip_pos,
+                                 "host %s", ip) != 0) {
+            return -1;
+        }
+        ++clause_count;
     }
 
-    if (opts->port != 0) {
-        char port[32];
-        snprintf(port, sizeof(port), "%u", (unsigned)opts->port);
-        /*
-         * In pcap filter syntax, `port` implies tcp or udp depending on
-         * context, but to be explicit and predictable we match both.
-         * This is still efficient because the kernel BPF filters early.
-         */
-        snprintf(parts[nparts], MAX_FILTER, "(tcp port %s or udp port %s)",
-                 port, port);
-        nparts++;
+    if (opts != NULL && opts->port != 0) {
+        char port_clause[256];
+        size_t port_pos = 0;
+        int have_port_protocol = tcp_selected || udp_selected;
+
+        port_clause[0] = '\0';
+        if (tcp_selected && !udp_selected && type_count == 1) {
+            if (snifer_append_format(port_clause, sizeof(port_clause),
+                                     &port_pos, "tcp port %u",
+                                     (unsigned)opts->port) != 0) {
+                return -1;
+            }
+        } else if (udp_selected && !tcp_selected && type_count == 1) {
+            if (snifer_append_format(port_clause, sizeof(port_clause),
+                                     &port_pos, "udp port %u",
+                                     (unsigned)opts->port) != 0) {
+                return -1;
+            }
+        } else {
+            if (snifer_append_text(port_clause, sizeof(port_clause),
+                                   &port_pos, "(") != 0) {
+                return -1;
+            }
+            if (tcp_selected || !have_port_protocol) {
+                if (snifer_append_format(port_clause, sizeof(port_clause),
+                                         &port_pos, "tcp port %u",
+                                         (unsigned)opts->port) != 0) {
+                    return -1;
+                }
+            }
+            if ((!have_port_protocol || tcp_selected) && udp_selected) {
+                if (snifer_append_text(port_clause, sizeof(port_clause),
+                                       &port_pos, " or ") != 0) {
+                    return -1;
+                }
+            } else if (!have_port_protocol) {
+                if (snifer_append_text(port_clause, sizeof(port_clause),
+                                       &port_pos, " or ") != 0) {
+                    return -1;
+                }
+            }
+            if (udp_selected || !have_port_protocol) {
+                if (snifer_append_format(port_clause, sizeof(port_clause),
+                                         &port_pos, "udp port %u",
+                                         (unsigned)opts->port) != 0) {
+                    return -1;
+                }
+            }
+            if (snifer_append_text(port_clause, sizeof(port_clause),
+                                   &port_pos, ")") != 0) {
+                return -1;
+            }
+        }
+
+        if (clause_count >= 3) {
+            return -1;
+        }
+        size_t port_clause_len = strlen(port_clause);
+        if (port_clause_len >= sizeof(clauses[clause_count])) {
+            return -1;
+        }
+        memcpy(clauses[clause_count], port_clause, port_clause_len + 1);
+        ++clause_count;
     }
 
-    if (nparts == 0) {
-        buf[0] = '\0';
+    if (clause_count == 0) {
         return 0;
     }
 
-    buf[0] = '\0';
-    size_t pos = 0;
-    for (int i = 0; i < nparts; i++) {
-        if (i > 0) {
-            if (pos < bufsz - 1)
-                buf[pos++] = ' ';
-            if (pos < bufsz - 1)
-                buf[pos++] = '(';
+    pos = 0;
+    for (size_t i = 0; i < clause_count; ++i) {
+        if (i > 0 && snifer_append_text(buf, bufsz, &pos, " and ") != 0) {
+            return -1;
         }
-        size_t len = strnlen(parts[i], MAX_FILTER);
-        if (pos + len < bufsz) {
-            memcpy(buf + pos, parts[i], len);
-            pos += len;
-        }
-        if (i > 0) {
-            if (pos < bufsz - 1)
-                buf[pos++] = ')';
+        if (snifer_append_text(buf, bufsz, &pos, "(") != 0 ||
+            snifer_append_text(buf, bufsz, &pos, clauses[i]) != 0 ||
+            snifer_append_text(buf, bufsz, &pos, ")") != 0) {
+            return -1;
         }
     }
-    buf[pos] = '\0';
     return 0;
 }
 
@@ -331,9 +607,14 @@ int sniffer_apply_filters(pcap_t *handle,
                           size_t errbuf_size)
 {
     char filter[1024];
+
+    if (handle == NULL) {
+        snifer_set_error(errbuf, errbuf_size, "invalid capture handle");
+        return -1;
+    }
     if (snifer_build_filter(opts, filter, sizeof(filter)) != 0) {
-        snprintf(errbuf, errbuf_size,
-                 "invalid filter specification");
+        snifer_set_error(errbuf, errbuf_size,
+                         "invalid filter specification");
         return -1;
     }
 
@@ -348,15 +629,15 @@ int sniffer_apply_filters(pcap_t *handle,
     }
 
     if (pcap_compile(handle, &fp, filter, 1, PCAP_NETMASK_UNKNOWN) == -1) {
-        snprintf(errbuf, errbuf_size,
-                 "failed to compile filter '%s': %s",
-                 filter, pcap_geterr(handle));
+        snifer_set_error(errbuf, errbuf_size,
+                         "failed to compile filter '%s': %s",
+                         filter, pcap_geterr(handle));
         return -1;
     }
     if (pcap_setfilter(handle, &fp) == -1) {
-        snprintf(errbuf, errbuf_size,
-                 "failed to set filter '%s': %s",
-                 filter, pcap_geterr(handle));
+        snifer_set_error(errbuf, errbuf_size,
+                         "failed to set filter '%s': %s",
+                         filter, pcap_geterr(handle));
         pcap_freecode(&fp);
         return -1;
     }
@@ -398,7 +679,8 @@ static const u_char *snifer_ptr(const u_char *base,
                                        size_t offset,
                                        size_t size)
 {
-    if (base_len < offset + size) {
+    /* Check for overflow: offset > base_len, or size > remaining space */
+    if (offset > base_len || size > base_len - offset) {
         return NULL;
     }
     return base + offset;
@@ -422,7 +704,7 @@ static int snifer_parse_ipv4(const u_char *data,
 
     /* IPv4 header length must be a multiple of 4 bytes and at least 20 */
     uint8_t ihl_bytes = (uint8_t)(ip_hdr->ip_hl) * 4;
-    if (ihl_bytes < 20 || ihl_bytes > (uint8_t)(data_len)) {
+    if (ihl_bytes < 20 || ihl_bytes > data_len) {
         return -1;
     }
 
@@ -431,9 +713,13 @@ static int snifer_parse_ipv4(const u_char *data,
     *protocol = ip_hdr->ip_p;
     *tot_len = ntohs(ip_hdr->ip_len);
 
+    /* Cap payload to the declared IP total length */
+    size_t declared_payload = (*tot_len > ihl_bytes) ? (size_t)(*tot_len - ihl_bytes) : 0;
     if (ihl_bytes < data_len) {
         *payload = data + ihl_bytes;
         *payload_len = data_len - ihl_bytes;
+        if (*payload_len > declared_payload)
+            *payload_len = declared_payload;
     } else {
         *payload = NULL;
         *payload_len = 0;
@@ -750,8 +1036,7 @@ int sniffer_capture(const struct sniffer_options *opts)
 {
     char errbuf[PCAP_ERRBUF_SIZE];
     pcap_if_t *alldevs = NULL;
-    pcap_if_t *selected = NULL;
-    int count = 0;
+
     if (pcap_findalldevs(&alldevs, errbuf) == -1) {
         fprintf(stderr, "snifer: failed to enumerate interfaces: %s\n",
                 errbuf);
@@ -759,17 +1044,22 @@ int sniffer_capture(const struct sniffer_options *opts)
     }
     if (alldevs == NULL) {
         fprintf(stderr, "snifer: no capture interfaces found.\n");
-        pcap_freealldevs(alldevs);
         return -1;
     }
 
+    /* Count and verify exactly one interface exists */
+    int count = 0;
+    const pcap_if_t *selected = NULL;
     for (const pcap_if_t *d = alldevs; d != NULL; d = d->next) {
         count++;
+        if (count == 1) {
+            selected = d;
+        }
     }
-    pcap_freealldevs(alldevs);
 
     if (count == 0) {
         fprintf(stderr, "snifer: no capture interfaces found.\n");
+        pcap_freealldevs(alldevs);
         return -1;
     }
 
@@ -782,21 +1072,21 @@ int sniffer_capture(const struct sniffer_options *opts)
         return -1;
     }
 
-    if (pcap_findalldevs(&alldevs, errbuf) == -1) {
-        return -1;
-    }
-    selected = alldevs;
+    /* Copy the name before freeing the list */
+    char name[256];
+    snprintf(name, sizeof(name), "%s", selected->name);
     pcap_freealldevs(alldevs);
 
-    pcap_t *handle = sniffer_open_interface(selected->name, errbuf,
-                                            sizeof(errbuf));
+    pcap_t *handle = sniffer_open_interface(name, errbuf, sizeof(errbuf));
     if (handle == NULL) {
-        fprintf(stderr, "snifer: cannot open %s: %s\n",
-                selected->name, errbuf);
+        fprintf(stderr, "snifer: cannot open %s: %s\n", name, errbuf);
         return -1;
     }
 
-    return sniffer_run_capture(handle, opts);
+    int rc = sniffer_run_capture(handle, opts);
+    /* sniffer_run_capture no longer closes the handle; caller is responsible */
+    sniffer_close(handle);
+    return rc;
 }
 
 int sniffer_run_capture(pcap_t *handle,
@@ -807,29 +1097,35 @@ int sniffer_run_capture(pcap_t *handle,
         return -1;
     }
 
+    /*
+     * NOTE: This function does NOT close the handle. The caller retains
+     * ownership and must call sniffer_close() after this returns.
+     */
+
     char errbuf[PCAP_ERRBUF_SIZE];
     if (opts != NULL) {
         if (sniffer_apply_filters(handle, opts, errbuf,
                                   sizeof(errbuf)) != 0) {
             fprintf(stderr, "snifer: %s\n", errbuf);
-            pcap_close(handle);
             return -1;
         }
     }
 
     /* Install a simple SIGINT handler so we can shut down cleanly. */
+    struct sigaction old_sa_int, old_sa_term;
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = snifer_signal_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, &old_sa_int);
+    sigaction(SIGTERM, &sa, &old_sa_term);
 
     fprintf(stdout,
             "snifer: capturing packets (Ctrl+C to stop)...\n\n");
 
     int packet_count = 0;
+    snifer_running = 1;
 
     while (snifer_running) {
         struct pcap_pkthdr *hdr = NULL;
@@ -857,7 +1153,9 @@ int sniffer_run_capture(pcap_t *handle,
     }
 
     fprintf(stdout, "\nsnifer: captured %d packet(s).\n", packet_count);
-    pcap_close(handle);
+    /* Restore original signal handlers */
+    sigaction(SIGINT, &old_sa_int, NULL);
+    sigaction(SIGTERM, &old_sa_term, NULL);
     return 0;
 }
 

@@ -12,8 +12,9 @@
  * source or destination ports.
  */
 struct sniffer_options {
-    /* Packet type filter: "all", "tcp", "udp", "icmp", "arp", or NULL
-     * for "all". Exact matching is case-insensitive where applicable. */
+    /* Packet type filter: "all", one of the supported protocol names, or a
+     * case-insensitive "or" expression such as "tcp or udp". NULL and an
+     * empty string mean "all". */
     const char *packet_type;
 
     /* Optional IP filter, e.g. "192.168.1.5". If non-NULL, only packets
@@ -64,14 +65,20 @@ int sniffer_apply_filters(pcap_t *handle,
  * Snapshot output is printed to stdout.
  *
  * opts may be NULL if no filter is needed.
- * Returns 0 on clean exit, -1 on fatal error.
+ * The caller retains ownership of handle and must call sniffer_close() after
+ * this function returns. Returns 0 on clean exit, -1 on fatal error.
  */
 int sniffer_run_capture(pcap_t *handle,
                         const struct sniffer_options *opts);
 
 /**
- * sniffer_close - free resources associated with a handle opened by
- * sniffer_init().
+ * sniffer_capture - compatibility helper that captures on the first
+ * available interface. The helper owns and closes its temporary handle.
+ */
+int sniffer_capture(const struct sniffer_options *opts);
+
+/**
+ * sniffer_close - free resources associated with a capture handle.
  */
 void sniffer_close(pcap_t *handle);
 
