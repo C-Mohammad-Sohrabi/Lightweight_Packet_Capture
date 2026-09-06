@@ -77,9 +77,9 @@ sudo ./snifer --type tcp --port 80
 
 ## Files
 
-* `snifer.h` — public API
-* `snifer.c` — capture and packet decoding
-* `main.c` — CLI and interactive menu
+* `include/snifer.h` — public API
+* `src/snifer.c` — capture and packet decoding
+* `src/main.c` — CLI and interactive menu
 * `Makefile` — macOS/Linux build
 * `CMakeLists.txt` — cross-platform build
 

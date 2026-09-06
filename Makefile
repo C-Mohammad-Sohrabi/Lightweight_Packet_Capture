@@ -22,7 +22,8 @@ CC ?= cc
 CFLAGS ?= -Wall -Wextra -O2 -std=c11
 LDFLAGS ?= -lpcap
 
-SRCS = main.c snifer.c
+SRCS = src/main.c src/snifer.c
+HDRS = include/snifer.h
 OBJS = $(SRCS:.c=.o)
 TARGET = snifer
 
@@ -33,8 +34,8 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-%.o: %.c snifer.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+src/%.o: src/%.c $(HDRS)
+	$(CC) $(CFLAGS) -I include -c -o $@ $<
 
 clean:
 	rm -f $(OBJS) $(TARGET)

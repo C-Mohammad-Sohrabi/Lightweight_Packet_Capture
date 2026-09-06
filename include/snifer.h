@@ -30,12 +30,14 @@ struct sniffer_options {
 };
 
 /**
- * sniffer_init - discover and open the best available capture interface.
+ * sniffer_open_interface - open a specific capture interface.
  *
  * Returns NULL on failure and sets errbuf with a human-readable message.
  * The caller must free the returned handle with sniffer_close().
  */
-pcap_t *sniffer_init(int *dev_idx_out, char *errbuf, size_t errbuf_size);
+pcap_t *sniffer_open_interface(const char *device_name,
+                               char *errbuf,
+                               size_t errbuf_size);
 
 /**
  * sniffer_list_devices - print available capture interfaces to stdout.
@@ -46,6 +48,9 @@ int sniffer_list_devices(char *errbuf, size_t errbuf_size);
 /**
  * sniffer_apply_filters - compile and apply a pcap filter for the given
  * options. Returns 0 on success, -1 on error (error text in errbuf).
+ *
+ * If opts describes an empty filter, the existing capture filter is
+ * left untouched.
  */
 int sniffer_apply_filters(pcap_t *handle,
                           const struct sniffer_options *opts,
@@ -53,14 +58,16 @@ int sniffer_apply_filters(pcap_t *handle,
                           size_t errbuf_size);
 
 /**
- * sniffer_capture - run a live capture session using sniffer_options.
+ * sniffer_run_capture - capture from an already-opened handle.
  *
  * This blocks until the session is interrupted (Ctrl+C) or an error occurs.
  * Snapshot output is printed to stdout.
  *
+ * opts may be NULL if no filter is needed.
  * Returns 0 on clean exit, -1 on fatal error.
  */
-int sniffer_capture(const struct sniffer_options *opts);
+int sniffer_run_capture(pcap_t *handle,
+                        const struct sniffer_options *opts);
 
 /**
  * sniffer_close - free resources associated with a handle opened by

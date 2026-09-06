@@ -46,6 +46,10 @@ static void snifer_signal_handler(int signo)
  * Tiny helpers
  * --------------------------------------------------------------------------- */
 
+/* Quiet stdout/stderr buffering so the menu and capture output don't get
+ * interleaved in odd ways. */
+
+
 static int snifer_strtolower(char *dst, const char *src, size_t n)
 {
     size_t i;
@@ -168,109 +172,39 @@ int sniffer_list_devices(char *errbuf, size_t errbuf_size)
  * Interface selection + open
  * --------------------------------------------------------------------------- */
 
-pcap_t *sniffer_init(int *dev_idx_out, char *errbuf, size_t errbuf_size)
+pcap_t *sniffer_open_interface(const char *device_name,
+                               char *errbuf,
+                               size_t errbuf_size)
 {
-    pcap_if_t *alldevs = NULL;
-    pcap_if_t *d = NULL;
-    int count = 0;
-    int choice = 0;
-
-    if (pcap_findalldevs(&alldevs, errbuf) == -1) {
-        return NULL;
-    }
-    if (alldevs == NULL) {
+    if (device_name == NULL || device_name[0] == '\0') {
         snprintf(errbuf, errbuf_size,
-                 "no capture interfaces available");
-        return NULL;
-    }
-
-    for (d = alldevs; d != NULL; d = d->next) {
-        count++;
-    }
-
-    pcap_freealldevs(alldevs);
-
-    if (count == 0) {
-        snprintf(errbuf, errbuf_size,
-                 "no capture interfaces available");
-        return NULL;
-    }
-
-    pcap_if_t *selected = NULL;
-
-    if (count == 1) {
-        /* Convenience: pick the single device automatically */
-        if (pcap_findalldevs(&alldevs, errbuf) == -1) {
-            return NULL;
-        }
-        selected = alldevs;
-        if (dev_idx_out) *dev_idx_out = 1;
-    } else {
-        /* Interactive selection. In a fully non-interactive tool you might
-         * want an environment variable or command-line flag instead, but
-         * this keeps the initial version simple and usable. */
-        fprintf(stdout,
-                "Multiple capture interfaces found. Select one by number "
-                "[1-%d]: ",
-                count);
-        fflush(stdout);
-
-        if (scanf("%d", &choice) != 1 || choice < 1 || choice > count) {
-            fprintf(stderr, "snifer: invalid selection.\n");
-            pcap_freealldevs(alldevs);
-            return NULL;
-        }
-
-        if (pcap_findalldevs(&alldevs, errbuf) == -1) {
-            return NULL;
-        }
-        d = alldevs;
-        for (int i = 1; i < choice; i++) {
-            if (d->next == NULL) {
-                fprintf(stderr, "snifer: unexpected interface list.\n");
-                pcap_freealldevs(alldevs);
-                return NULL;
-            }
-            d = d->next;
-        }
-        selected = d;
-        if (dev_idx_out) *dev_idx_out = choice;
-    }
-
-    if (selected == NULL) {
-        snprintf(errbuf, errbuf_size,
-                 "no interface selected");
-        if (alldevs) pcap_freealldevs(alldevs);
+                 "no interface specified");
         return NULL;
     }
 
     /*
-     * Open the device.
+     * pcap_open_live() is the portable entry point.
      *
-     * pcap_open_live() is the portable entry point. Npcap on Windows
-     * supports the same API; the main cross-platform caveats are:
+     * Npcap on Windows supports the same API; the main cross-platform
+     * caveats are:
      *   - snapshot length
      *   - promiscuous mode (often ignored on WiFi on macOS)
-     *   - timeout for non-blocking readiness
+     *   - timeout for pcap_next_ex readiness
      */
     int snaplen = 65535; /* capture full packets by default */
-    int promisc = 1;
+    int promisc = 0;     /* start conservative on macOS; user can change */
     int timeout = 50;    /* milliseconds; affects pcap_next_ex readiness */
 
-    pcap_t *handle = pcap_open_live(selected->name, snaplen, promisc,
+    pcap_t *handle = pcap_open_live(device_name, snaplen, promisc,
                                     timeout, errbuf);
     if (handle == NULL) {
-        fprintf(stderr, "snifer: cannot open %s: %s\n", selected->name,
-                errbuf);
-        pcap_freealldevs(alldevs);
         return NULL;
     }
 
-    /* Verify link-layer type support before proceeding */
+    /* Verify link-layer type is usable before proceeding. */
     int linktype = pcap_datalink(handle);
-    (void)linktype; /* used for decoding decisions below */
+    (void)linktype;
 
-    pcap_freealldevs(alldevs);
     return handle;
 }
 
@@ -407,13 +341,9 @@ int sniffer_apply_filters(pcap_t *handle,
     memset(&fp, 0, sizeof(fp));
 
     if (filter[0] == '\0') {
-        /* No filter: clear any existing filter if present */
-        if (pcap_setfilter(handle, NULL) == -1) {
-            snprintf(errbuf, errbuf_size,
-                     "failed to clear capture filter: %s",
-                     pcap_geterr(handle));
-            return -1;
-        }
+        /* No filter requested. Do not touch the capture filter at all, so
+         * we do not fail on platforms or interfaces where pcap_setfilter
+         * with NULL is not supported. */
         return 0;
     }
 
@@ -819,17 +749,72 @@ static void snifer_print_packet(const u_char *capture,
 int sniffer_capture(const struct sniffer_options *opts)
 {
     char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t *handle = sniffer_init(NULL, errbuf, sizeof(errbuf));
-    if (handle == NULL) {
-        fprintf(stderr, "snifer: %s\n", errbuf);
+    pcap_if_t *alldevs = NULL;
+    pcap_if_t *selected = NULL;
+    int count = 0;
+    if (pcap_findalldevs(&alldevs, errbuf) == -1) {
+        fprintf(stderr, "snifer: failed to enumerate interfaces: %s\n",
+                errbuf);
+        return -1;
+    }
+    if (alldevs == NULL) {
+        fprintf(stderr, "snifer: no capture interfaces found.\n");
+        pcap_freealldevs(alldevs);
         return -1;
     }
 
-    if (sniffer_apply_filters(handle, opts, errbuf,
-                              sizeof(errbuf)) != 0) {
-        fprintf(stderr, "snifer: %s\n", errbuf);
-        pcap_close(handle);
+    for (const pcap_if_t *d = alldevs; d != NULL; d = d->next) {
+        count++;
+    }
+    pcap_freealldevs(alldevs);
+
+    if (count == 0) {
+        fprintf(stderr, "snifer: no capture interfaces found.\n");
         return -1;
+    }
+
+    if (count != 1) {
+        fprintf(stderr,
+                "snifer: sniffer_capture() is only usable when exactly one "
+                "interface is available. For interactive sessions, use the "
+                "menu in main().\n");
+        pcap_freealldevs(alldevs);
+        return -1;
+    }
+
+    if (pcap_findalldevs(&alldevs, errbuf) == -1) {
+        return -1;
+    }
+    selected = alldevs;
+    pcap_freealldevs(alldevs);
+
+    pcap_t *handle = sniffer_open_interface(selected->name, errbuf,
+                                            sizeof(errbuf));
+    if (handle == NULL) {
+        fprintf(stderr, "snifer: cannot open %s: %s\n",
+                selected->name, errbuf);
+        return -1;
+    }
+
+    return sniffer_run_capture(handle, opts);
+}
+
+int sniffer_run_capture(pcap_t *handle,
+                        const struct sniffer_options *opts)
+{
+    if (handle == NULL) {
+        fprintf(stderr, "snifer: invalid capture handle\n");
+        return -1;
+    }
+
+    char errbuf[PCAP_ERRBUF_SIZE];
+    if (opts != NULL) {
+        if (sniffer_apply_filters(handle, opts, errbuf,
+                                  sizeof(errbuf)) != 0) {
+            fprintf(stderr, "snifer: %s\n", errbuf);
+            pcap_close(handle);
+            return -1;
+        }
     }
 
     /* Install a simple SIGINT handler so we can shut down cleanly. */

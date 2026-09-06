@@ -495,6 +495,11 @@ static void print_summary(const struct sniffer_options *opts,
 
 int main(void)
 {
+    /* Make sure output appears immediately; the menu and capture loop both
+     * print frequently and should not get interleaved. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     char errbuf[PCAP_ERRBUF_SIZE];
 
     printf("=== Lightweight Packet Capture (snifer) ===\n");
@@ -537,9 +542,20 @@ int main(void)
 
     strlist_free(&selected_types);
 
+    /* Open the exact interface the user chose, once, before capture. */
+    pcap_t *handle = sniffer_open_interface(devchoice.selected->name,
+                                            errbuf,
+                                            sizeof(errbuf));
+    if (handle == NULL) {
+        fprintf(stderr, "snifer: cannot open %s: %s\n",
+                devchoice.selected->name, errbuf);
+        return 1;
+    }
+
     print_summary(&opts, devchoice.selected);
 
     printf("Starting capture... (Ctrl+C to stop)\n\n");
-    int rc = sniffer_capture(&opts);
+    int rc = sniffer_run_capture(handle, &opts);
+    /* sniffer_run_capture closes the handle on all paths. */
     return rc == 0 ? 0 : 1;
 }

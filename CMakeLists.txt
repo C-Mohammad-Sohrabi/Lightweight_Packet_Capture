@@ -33,9 +33,9 @@ find_package_handle_standard_args(PCAP
   REQUIRED_VARS PCAP_LIBRARY PCAP_INCLUDE_DIR
 )
 
-add_executable(snifer main.c snifer.c)
+add_executable(snifer src/main.c src/snifer.c)
 
-target_include_directories(snifer PRIVATE ${PCAP_INCLUDE_DIR})
+target_include_directories(snifer PRIVATE ${PCAP_INCLUDE_DIR} include)
 target_link_libraries(snifer PRIVATE ${PCAP_LIBRARY})
 
 # Helpful warnings
