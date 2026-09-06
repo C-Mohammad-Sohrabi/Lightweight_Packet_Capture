@@ -451,7 +451,14 @@ static int snifer_build_filter(const struct sniffer_options *opts,
     }
     buf[0] = '\0';
 
-    if (snifer_parse_type_bits(opts != NULL ? opts->packet_type : NULL,
+    /* Treat NULL, empty, and "all" as "capture everything" */
+    const char *ptype = NULL;
+    if (opts != NULL && opts->packet_type != NULL &&
+        opts->packet_type[0] != '\0' &&
+        strcmp(opts->packet_type, "all") != 0) {
+        ptype = opts->packet_type;
+    }
+    if (snifer_parse_type_bits(ptype,
                                type_bits, MAX_TYPE_TERMS, &type_count,
                                &all_types) != 0) {
         return -1;
