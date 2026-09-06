@@ -1,0 +1,13 @@
+# Build artifacts
+snifer
+*.o
+build/
+
+# Editor stuff
+*~
+*.swp
+*.swo
+*.orig
+
+# OS
+.DS_Store
